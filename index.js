@@ -1,5 +1,5 @@
 /**
- * DOM Window 0.4.0
+ * DOM Window 0.4.1
  *
  * 只窗口化 ST 的消息 DOM，不改 chat 数据。
  * - chat 数组保持完整，AI 上下文、存档、消息 ID 不变。
@@ -14,7 +14,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.4.0';
+  const VERSION = '0.4.1';
   const LOG = '[DOMWindow]';
   const EXTENSION_BASE = new URL('.', import.meta.url).href;
   const STORAGE_KEY = 'STDOMWindow';
