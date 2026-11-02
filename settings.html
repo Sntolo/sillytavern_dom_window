@@ -1,0 +1,27 @@
+<div id="dom_window_settings">
+    <div class="inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header">
+            <b>DOM Window</b>
+            <span id="dom_window_header_state" class="dom-window-header-state">已关闭</span>
+            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+        </div>
+        <div class="inline-drawer-content">
+            <label class="checkbox_label" for="dom_window_autostart">
+                <input type="checkbox" id="dom_window_autostart">
+                <small>进入聊天时自动开启</small>
+            </label>
+            <div class="dom-window-preload">
+                <label for="dom_window_preload"><small>预加载楼层</small></label>
+                <input type="number" id="dom_window_preload" min="1" max="100" step="1" value="5" inputmode="numeric">
+                <button type="button" id="dom_window_preload_save" class="menu_button">保存</button>
+            </div>
+            <div id="dom_window_status" class="dom-window-status" data-enabled="false">
+                <div class="dom-window-status-line">
+                    <span id="dom_window_timer">运行 00:00:00</span>
+                    <span id="dom_window_state">已关闭</span>
+                </div>
+                <div id="dom_window_metrics" class="dom-window-status-metrics">窗口 — · 已加载 0/0 层<br>DOM 0 · 堆内存 —</div>
+            </div>
+        </div>
+    </div>
+</div>
