@@ -1,5 +1,5 @@
 /**
- * DOM Window 0.4.1
+ * DOM Window 0.4.2
  *
  * 只窗口化 ST 的消息 DOM，不改 chat 数据。
  * - chat 数组保持完整，AI 上下文、存档、消息 ID 不变。
@@ -14,7 +14,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.4.1';
+  const VERSION = '0.4.2';
   const LOG = '[DOMWindow]';
   const EXTENSION_BASE = new URL('.', import.meta.url).href;
   const STORAGE_KEY = 'STDOMWindow';
@@ -39,6 +39,9 @@
     batch: 2,
     defaultHeight: 4800,
     nearViewportFactor: 1.5,
+    // 回收视口外楼层时需要留出的安全距离（视口高度的倍数）。
+    // 太小会让刚挂上的楼层立刻被回收，形成反复重建。
+    trimFactor: 2,
     manageTruncation: false,
     debug: false,
   };
@@ -60,9 +63,17 @@
     listeners: [],
     originalTruncation: null,
     applying: false,
-    syntheticIds: new Set(),
-    syntheticTimer: 0,
+    forceApply: false,
+    tailRef: null,
+    // 自己刷新补发的 message_rendered：楼层号 -> 过期时刻。
+    // 用一个固定时长的总计时器靠不住——机器忙、iframe 多时事件会晚到，
+    // 漏判一次就会重排，重排又刷新，形成源码/渲染来回闪的死循环。
+    selfRenders: new Map(),
+    sweepTimer: 0,
   };
+
+  const SELF_RENDER_TTL = 20000;
+  const SWEEP_INTERVAL = 5000;
 
   const log = (...args) => console.debug(LOG, ...args);
 
@@ -99,15 +110,25 @@
     return el;
   }
 
+  // 记下由本插件亲手挂上去的楼层元素：这些才需要补发渲染事件。
+  // 酒馆自己渲染的新楼层已经完整拉过一次界面，再刷新就是白白闪一次。
+  const mountedByUs = new WeakSet();
+
   function mountMessage(id, { beforeId, afterId } = {}) {
     const ctx = getCtx();
     const mes = ctx?.chat?.[id];
     if (!mes) return null;
+    // 酒馆可能已经把这一层挂上去了（新消息就是它自己渲染的），
+    // 再 addOneMessage 一次会出两个同 mesid 的楼层。
+    const existing = getChatEl()?.querySelector(`:scope > .mes[mesid="${id}"]`);
+    if (existing) return { el: existing, created: false };
     const opts = { forceId: id, scroll: false };
     if (typeof beforeId === 'number') opts.insertBefore = beforeId;
     else if (typeof afterId === 'number') opts.insertAfter = afterId;
     const result = ctx.addOneMessage(mes, opts);
-    return result?.[0] || result?.get?.(0) || null;
+    const el = result?.[0] || result?.get?.(0) || null;
+    if (el) mountedByUs.add(el);
+    return el ? { el, created: true } : null;
   }
 
   // addOneMessage 只重建正文，不会补发消息渲染事件；酒馆助手的楼层界面
@@ -117,19 +138,28 @@
     return /PlaceHolder|<html[\s>]|<head[\s>]|<body[\s>]/i.test(text);
   }
 
-  function refreshMountedMessages(ids) {
+  function refreshMountedMessages(ids, { force = false } = {}) {
     const helper = window.TavernHelper;
     const refresh = helper?.refreshOneMessage;
     if (typeof refresh !== 'function') return;
 
-    const targets = ids.filter(id => hasFrontendBlock(getChat()[id]));
+    // 默认只刷新自己挂上去的楼层。酒馆自己渲染的新楼层界面是完整的，
+    // 再刷一次等于让用户多看见一闪。
+    // force 用于关闭窗口后的全量恢复：那时楼层已被 printMessages 重印，
+    // 不出自本插件，但界面确实需要补回来。
+    const targets = ids.filter(id => {
+      if (!hasFrontendBlock(getChat()[id])) return false;
+      if (force) return true;
+      const el = getChatEl()?.querySelector(`:scope > .mes[mesid="${id}"]`);
+      return el ? mountedByUs.has(el) : false;
+    });
     if (!targets.length) return;
 
-    // 刷新会补发 message_rendered，事件是异步派发的；按楼层号标记，
+    // 刷新会补发 message_rendered，事件是异步派发的；按楼层号记下过期时刻，
     // 避免 DOMWindow 把自己的补渲染当成外部更新又重排一次。
-    for (const id of targets) state.syntheticIds.add(id);
-    clearTimeout(state.syntheticTimer);
-    state.syntheticTimer = setTimeout(() => state.syntheticIds.clear(), 1000);
+    const expires = Date.now() + SELF_RENDER_TTL;
+    for (const id of targets) state.selfRenders.set(Number(id), expires);
+    armSweep();
 
     for (const id of targets) {
       safe(() => {
@@ -141,13 +171,47 @@
     }
   }
 
+  // 每条自刷新独立记时（不是整批共用一个定时器），过期后清掉，避免长期占用内存。
+  function armSweep() {
+    if (state.sweepTimer) return;
+    state.sweepTimer = setInterval(() => {
+      const now = Date.now();
+      let alive = 0;
+      for (const [key, expires] of state.selfRenders) {
+        if (expires > now) alive++;
+        else state.selfRenders.delete(key);
+      }
+      if (!alive) {
+        clearInterval(state.sweepTimer);
+        state.sweepTimer = 0;
+      }
+    }, SWEEP_INTERVAL);
+  }
+
+  function isSelfRender(id) {
+    const key = Number(id);
+    const expires = state.selfRenders.get(key);
+    if (expires == null) return false;
+    if (expires < Date.now()) {
+      state.selfRenders.delete(key);
+      return false;
+    }
+    return true;
+  }
+
+  function clearSelfRenders() {
+    state.selfRenders.clear();
+    clearInterval(state.sweepTimer);
+    state.sweepTimer = 0;
+  }
+
   function refreshAllMounted() {
     const chatEl = getChatEl();
     if (!chatEl) return;
     const ids = [...chatEl.querySelectorAll(':scope > .mes')]
       .map(el => Number(el.getAttribute('mesid')))
       .filter(Number.isFinite);
-    refreshMountedMessages(ids);
+    refreshMountedMessages(ids, { force: true });
   }
 
   function measureMounted() {
@@ -161,10 +225,20 @@
     }
   }
 
+  // 未挂载楼层用实测均值估高。写死的 defaultHeight（4800）和这张卡的实际
+  // 楼层高度差得远，估出来的占位会让滚动位置一跳一跳，落回去又触发新一轮加载。
+  function estimateHeight() {
+    if (!state.heights.size) return config.defaultHeight;
+    let total = 0;
+    for (const height of state.heights.values()) total += height;
+    return total / state.heights.size;
+  }
+
   function sumHeights(from, to) {
     if (to < from) return 0;
+    const fallback = estimateHeight();
     let total = 0;
-    for (let i = from; i <= to; i++) total += state.heights.get(i) ?? config.defaultHeight;
+    for (let i = from; i <= to; i++) total += state.heights.get(i) ?? fallback;
     return total;
   }
 
@@ -187,12 +261,35 @@
     state.bottomSpacer = null;
   }
 
-  function apply() {
+  // 窗口内容已和 chat 对齐时直接返回，避免进场时 ST 的两次渲染事件各掀一次整窗重建。
+  // 光比楼层号不够：换聊天后楼层号可能刚好一样，必须认消息对象本身。
+  // 同一份 chat 里消息对象不会换，换聊天/重载会整批换成新对象。
+  function windowMatchesChat() {
+    const chatEl = getChatEl();
+    const chat = getChat();
+    if (!state.mounted || !chatEl || !chat.length) return false;
+    if (!state.topSpacer?.isConnected || !state.bottomSpacer?.isConnected) return false;
+    if (state.pinnedId !== chat.length - 1) return false;
+    if (chat[state.pinnedId] !== state.tailRef) return false;
+
+    const ids = [...chatEl.querySelectorAll(':scope > .mes')]
+      .map(el => Number(el.getAttribute('mesid')))
+      .filter(Number.isFinite);
+    const expected = state.end - state.start + 2; // 窗口内 + 固定的最后一层
+    if (ids.length !== expected) return false;
+    for (let i = state.start; i <= state.end; i++) {
+      if (!ids.includes(i)) return false;
+    }
+    return ids.includes(state.pinnedId);
+  }
+
+  function apply(force = false) {
     if (!state.enabled || state.applying) return false;
     const ctx = getCtx();
     const chat = ctx?.chat;
     const chatEl = getChatEl();
     if (!ctx || !chat?.length || !chatEl) return false;
+    if (!force && windowMatchesChat()) return false;
 
     state.applying = true;
     state.chatEl = chatEl;
@@ -205,11 +302,15 @@
     state.start = start;
     state.end = end;
 
+    // created=false 的是酒馆已经挂好的楼层，界面完整，不需要再刷新
     const mountedIds = [];
-    for (let i = start; i <= end; i++) {
-      if (mountMessage(i)) mountedIds.push(i);
-    }
-    if (mountMessage(state.pinnedId)) mountedIds.push(state.pinnedId);
+    const collect = (id) => {
+      const res = mountMessage(id);
+      if (res?.created) mountedIds.push(id);
+      return !!res;
+    };
+    for (let i = start; i <= end; i++) collect(i);
+    collect(state.pinnedId);
     refreshMountedMessages(mountedIds);
 
     state.topSpacer = createSpacer('top');
@@ -225,17 +326,82 @@
     chatEl.scrollTop = chatEl.scrollHeight;
     state.applying = false;
     state.mounted = true;
+    state.tailRef = chat[state.pinnedId] ?? null;
     log('applied', { chatLength: chat.length, start, end, pinnedId: state.pinnedId });
     return true;
   }
 
-  function scheduleApply(delay = 120) {
+  function scheduleApply(delay = 120, force = false) {
     if (!state.enabled) return;
+    state.forceApply = state.forceApply || force;
     clearTimeout(state.applyTimer);
     state.applyTimer = setTimeout(() => {
       state.applyTimer = 0;
-      apply();
+      const forced = state.forceApply;
+      state.forceApply = false;
+      apply(forced);
     }, delay);
+  }
+
+  // 追加新楼层时只补挂尾部，不整窗重建。
+  // 整窗重建会先删掉所有 .mes 再逐个 addOneMessage，画面就是「源码 → 渲染」闪一次；
+  // 每来一条回复都闪一次太难看，所以窗口完好、只多了几层时走这条路。
+  function syncTail() {
+    const chatEl = getChatEl();
+    const chat = getChat();
+    if (!chatEl || !state.mounted || state.applying) return false;
+    if (!state.topSpacer?.isConnected || !state.bottomSpacer?.isConnected) return false;
+
+    const newPinned = chat.length - 1;
+    if (newPinned <= state.pinnedId) return false;
+
+    const mountedIds = [];
+    let afterId = state.pinnedId;
+    for (let id = state.pinnedId + 1; id <= newPinned; id++) {
+      const res = mountMessage(id, { afterId });
+      if (!res) {
+        // 中途失败就退回去走整窗重建，别留半截窗口
+        for (const done of mountedIds) {
+          chatEl.querySelector(`.mes[mesid="${done}"]`)?.remove();
+        }
+        return false;
+      }
+      if (res.created) mountedIds.push(id);
+      afterId = id;
+    }
+
+    state.end = newPinned - 1;
+    state.pinnedId = newPinned;
+    state.tailRef = chat[newPinned] ?? null;
+    const pinnedEl = chatEl.querySelector(`.mes[mesid="${newPinned}"]`);
+    if (!pinnedEl) return false;
+    pinnedEl.before(state.bottomSpacer);
+    refreshMountedMessages(mountedIds);
+    measureMounted();
+    updateSpacers();
+    trim();
+    return true;
+  }
+
+  // 外部真的渲染了某层（不是我们刷新的）时才动窗口。
+  // 楼层号在窗口外的渲染不需要重排，否则任何无关楼层的事件都会掀起一次整窗重建。
+  function handleExternalRender(id) {
+    if (!state.mounted) {
+      scheduleApply(250);
+      return;
+    }
+    const length = getChat().length;
+    if (length > state.pinnedId + 1) {
+      if (!syncTail()) scheduleApply(250);
+      return;
+    }
+    if (length < state.pinnedId + 1) {
+      scheduleApply(250);
+      return;
+    }
+    if (Number(id) < state.start) return;
+    measureMounted();
+    updateSpacers();
   }
 
   function prependBatch() {
@@ -248,31 +414,25 @@
     const firstEl = chatEl.querySelector(`.mes[mesid="${state.start}"]`);
     if (!firstEl) return;
     const beforeId = state.start;
-
-    let estimated = 0;
-    for (let i = newStart; i < state.start; i++) {
-      estimated += state.heights.get(i) ?? config.defaultHeight;
-    }
+    // 记住锚点楼层和它在视口里的位置，挂完新楼层后把它挪回原位，
+    // 这样占位估得准不准都不会让画面跳。
+    const anchorTop = firstEl.getBoundingClientRect().top;
 
     const mountedIds = [];
     for (let i = newStart; i < state.start; i++) {
-      if (mountMessage(i, { beforeId })) mountedIds.push(i);
+      const res = mountMessage(i, { beforeId });
+      if (res?.created) mountedIds.push(i);
     }
 
     state.start = newStart;
+    // trim() 只回收视口外太远的楼层，且受 maxWindow 约束；这里先不回收，
+    // 让锚点位移修正跑完再统一 trim，避免刚挂上就被删。
     refreshMountedMessages(mountedIds);
-
-    let added = 0;
-    for (const id of mountedIds) {
-      const el = chatEl.querySelector(`.mes[mesid="${id}"]`);
-      if (el) added += el.getBoundingClientRect().height;
-    }
     measureMounted();
     updateSpacers();
-    // 新楼层实际高度和占位估算不同时，修正滚动位置，避免视口跳动。
-    if (Math.abs(added - estimated) > 4) {
-      chatEl.scrollTop += added - estimated;
-    }
+
+    const anchorEl = chatEl.querySelector(`.mes[mesid="${beforeId}"]`);
+    if (anchorEl) chatEl.scrollTop += anchorEl.getBoundingClientRect().top - anchorTop;
   }
 
   function appendBatch() {
@@ -284,9 +444,9 @@
     let afterId = state.end;
     const mountedIds = [];
     for (let i = state.end + 1; i <= newEnd; i++) {
-      const el = mountMessage(i, { afterId });
-      if (!el) break;
-      mountedIds.push(i);
+      const res = mountMessage(i, { afterId });
+      if (!res) break;
+      if (res.created) mountedIds.push(i);
       afterId = i;
     }
 
@@ -296,37 +456,49 @@
     updateSpacers();
   }
 
-  function trim() {
+  // 回收视口外的楼层。
+  // 关键点：只能回收「离视口很远」的楼层。原来的判据是 0.25 个视口，
+  // 上滚时刚补上的楼层正好落在这个范围里，删掉后下一帧又补回来，
+  // 同一层反复重建，画面就在源码和渲染之间来回闪。
+  function removeEdge(side) {
     const chatEl = getChatEl();
-    if (!chatEl) return;
-    const viewport = chatEl.clientHeight;
-    const chatTop = chatEl.getBoundingClientRect().top;
-    const visibleTop = chatTop + viewport * 0.25;
-    const visibleBottom = chatTop + viewport * 1.25;
+    if (!chatEl) return false;
+    const id = side === 'top' ? state.start : state.end;
+    if (side === 'top' && state.start > state.end) return false;
 
+    const el = chatEl.querySelector(`:scope > .mes[mesid="${id}"]`);
+    if (!el) {
+      // 已经不在 DOM 里，只同步指针
+      if (side === 'top') state.start++;
+      else state.end--;
+      return true;
+    }
+
+    const rect = el.getBoundingClientRect();
+    const chatRect = chatEl.getBoundingClientRect();
+    const margin = chatEl.clientHeight * config.trimFactor;
+    const far = side === 'top'
+      ? rect.bottom < chatRect.top - margin
+      : rect.top > chatRect.bottom + margin;
+    if (!far) return false;
+
+    state.heights.set(id, rect.height);
+    el.remove();
+    if (side === 'top') state.start++;
+    else state.end--;
+    return true;
+  }
+
+  function countWindow() {
+    return state.end - state.start + 1;
+  }
+
+  function trim() {
     let guard = 0;
-    while (state.end - state.start + 1 > config.maxWindow && guard++ < 20) {
-      const topEl = chatEl.querySelector(`.mes[mesid="${state.start}"]`);
-      if (!topEl) break;
-      const rect = topEl.getBoundingClientRect();
-      if (rect.bottom > visibleTop) break;
-      state.heights.set(state.start, rect.height);
-      topEl.remove();
-      state.start++;
-      updateSpacers();
+    while (countWindow() > config.maxWindow && guard++ < 40) {
+      if (!removeEdge('top') && !removeEdge('bottom')) break;
     }
-
-    guard = 0;
-    while (state.end - state.start + 1 > config.maxWindow && guard++ < 20) {
-      const bottomEl = chatEl.querySelector(`.mes[mesid="${state.end}"]`);
-      if (!bottomEl) break;
-      const rect = bottomEl.getBoundingClientRect();
-      if (rect.top < visibleBottom) break;
-      state.heights.set(state.end, rect.height);
-      bottomEl.remove();
-      state.end--;
-      updateSpacers();
-    }
+    updateSpacers();
   }
 
   function onScroll() {
@@ -361,9 +533,13 @@
     if (id < 0 || id >= chat.length) return null;
 
     if (id < state.start) {
-      if (mountMessage(id, { beforeId: state.start })) refreshMountedMessages([id]);
+      const res = mountMessage(id, { beforeId: state.start });
+      if (res?.created) refreshMountedMessages([id]);
+      state.start = Math.min(state.start, id);
     } else if (id > state.end && id !== state.pinnedId) {
-      if (mountMessage(id, { afterId: state.end })) refreshMountedMessages([id]);
+      const res = mountMessage(id, { afterId: state.end });
+      if (res?.created) refreshMountedMessages([id]);
+      state.end = Math.max(state.end, id);
     }
     measureMounted();
     updateSpacers();
@@ -398,12 +574,18 @@
       state.listeners.push({ event, handler });
     };
 
-    on('CHAT_CHANGED', () => scheduleApply(300));
+    // 进入聊天时 ST 也会发 CHAT_CHANGED，但那时挂的就是这份 chat；
+    // 只有最后一层换了对象才是真的换聊天，才值得强制重建。
+    on('CHAT_CHANGED', () => {
+      const ctx = getCtx();
+      const last = ctx?.chat?.[ctx.chat.length - 1] ?? null;
+      scheduleApply(300, last !== state.tailRef);
+    });
     on('CHARACTER_MESSAGE_RENDERED', id => {
-      if (!state.syntheticIds.has(Number(id))) scheduleApply(250);
+      if (!isSelfRender(id)) handleExternalRender(id);
     });
     on('USER_MESSAGE_RENDERED', id => {
-      if (!state.syntheticIds.has(Number(id))) scheduleApply(250);
+      if (!isSelfRender(id)) handleExternalRender(id);
     });
     on('MESSAGE_DELETED', () => scheduleApply(250));
     on('MORE_MESSAGES_LOADED', () => scheduleApply(250));
@@ -446,8 +628,7 @@
     Object.assign(config, options || {});
     state.enabled = true;
     state.pinnedId = ctx.chat.length - 1;
-    clearTimeout(state.syntheticTimer);
-    state.syntheticIds.clear();
+    clearSelfRenders();
 
     if (config.manageTruncation) {
       const current = ctx.powerUserSettings?.chat_truncation ?? null;
@@ -469,8 +650,7 @@
   function disable() {
     if (!state.enabled) return;
     state.enabled = false;
-    clearTimeout(state.syntheticTimer);
-    state.syntheticIds.clear();
+    clearSelfRenders();
     clearTimeout(state.applyTimer);
     state.applyTimer = 0;
     if (state.scrollRaf) cancelAnimationFrame(state.scrollRaf);
